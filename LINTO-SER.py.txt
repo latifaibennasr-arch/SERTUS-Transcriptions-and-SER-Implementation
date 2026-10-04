@@ -1,0 +1,189 @@
+# ============================================================
+# SERTUS - LINTO TRANSCRIPTION-BASED SER
+# ============================================================
+#
+# Final LinTO protocol reported in the manuscript:
+#
+#   LinTO transcription
+#          |
+#   Stop-word removal
+#          |
+#   Camel Tools
+#          |
+#   TF-IDF / Word2Vec
+#          |
+#   ML / DL / TunBERT / AraBERT
+#
+# COTA is NOT applied to LinTO in the final experiment.
+#
+# ============================================================
+
+import sys
+from pathlib import Path
+
+# ------------------------------------------------------------
+# We reuse the complete Transkriptor pipeline implementation,
+# because the manuscript specifies the same preprocessing and
+# model configuration for LinTO and Transkriptor.
+#
+# IMPORTANT:
+# Copy 02_transkriptor_SER.py as this file and change ONLY
+# the ASR-specific configuration below.
+# ------------------------------------------------------------
+
+
+# ============================================================
+# ASR CONFIGURATION
+# ============================================================
+
+ASR_NAME = "LinTO"
+
+TRAIN_FILE = (
+    "data/augmented/"
+    "linto_train_augmented.xlsx"
+)
+
+VAL_FILE = (
+    "data/augmented/"
+    "linto_validation_original.xlsx"
+)
+
+TEST_FILE = (
+    "data/augmented/"
+    "linto_test_original.xlsx"
+)
+
+RESULT_DIR = Path(
+    "results/linto"
+)
+
+RESULT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ============================================================
+# IMPORTANT
+# ============================================================
+#
+# The complete implementation is identical to
+# 02_transkriptor_SER.py:
+#
+#   - stop-word removal
+#   - Camel Tools tokenization
+#   - TF-IDF
+#   - SVM
+#   - Naive Bayes
+#   - Logistic Regression
+#   - Random Forest (180 trees)
+#   - Word2Vec Skip-Gram
+#   - Word2Vec CBOW
+#   - LSTM
+#   - BiLSTM
+#   - TunBERT
+#   - AraBERTv0.2
+#   - five seeds
+#   - 180 epochs for DL
+#   - LR 0.001 / 0.002
+#   - Transformer LR 3e-5
+#   - batch size 16
+#   - weight decay 0.01
+#   - dropout 0.1
+#   - maximum 20 epochs
+#   - early stopping using validation F1
+#   - 10% warmup
+#
+# To avoid duplicating hundreds of lines in the repository,
+# the recommended implementation is:
+#
+#     sertus_ser_pipeline.py
+#
+# shared by:
+#
+#     01_voiser_SER.py
+#     02_transkriptor_SER.py
+#     03_linto_SER.py
+#
+# The three public entry points remain ASR-specific.
+#
+# ------------------------------------------------------------
+#
+# If you want this file to be completely standalone, copy
+# 02_transkriptor_SER.py into this file and replace:
+#
+#     "Transkriptor"
+#
+# by:
+#
+#     "LinTO"
+#
+# and replace the three file paths above.
+#
+# ============================================================
+
+
+def main():
+
+    print("=" * 70)
+
+    print(
+        "SERTUS - LinTO transcription-based SER"
+    )
+
+    print("=" * 70)
+
+    print(
+        f"Train: {TRAIN_FILE}"
+    )
+
+    print(
+        f"Validation: {VAL_FILE}"
+    )
+
+    print(
+        f"Test: {TEST_FILE}"
+    )
+
+    print(
+        "\nPreprocessing:"
+    )
+
+    print(
+        "Stop-word removal only"
+    )
+
+    print(
+        "\nModels:"
+    )
+
+    print(
+        "SVM / NB / LR / RF"
+    )
+
+    print(
+        "LSTM-SG / BiLSTM-SG"
+    )
+
+    print(
+        "LSTM-CBOW / BiLSTM-CBOW"
+    )
+
+    print(
+        "TunBERT / AraBERTv0.2"
+    )
+
+    print(
+        "\nNOTE:"
+    )
+
+    print(
+        "Use the implementation of "
+        "02_transkriptor_SER.py with the "
+        "LinTO paths above."
+    )
+
+
+if __name__ == "__main__":
+
+    main()

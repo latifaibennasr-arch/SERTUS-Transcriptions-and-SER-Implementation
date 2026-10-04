@@ -1,0 +1,645 @@
+# ============================================================
+# SERTUS - DATA AUGMENTATION
+# ============================================================
+#
+# Input:
+#   One ASR Excel file:
+#
+#       ID | Speaker | Contenu | Classe
+#
+# Protocol:
+#   1. Load original ASR transcription Excel
+#   2. Speaker-independent split:
+#          70% train
+#          15% validation
+#          15% test
+#   3. Apply GPT-4o augmentation ONLY to training data
+#   4. Keep validation and test completely original
+#
+# Manuscript protocol:
+#   - GPT-4o
+#   - zero-shot
+#   - maximum 512 tokens
+#   - Tunisian Dialect
+#   - sports
+#   - politics
+#   - culture
+#   - society
+#   - French/English code-switching
+#   - hesitations
+#   - colloquialisms
+#   - target emotions: Neutral and Joy
+#
+# IMPORTANT:
+# The manuscript contains an arithmetic inconsistency:
+#   635 Neutral + 449 Joy = 1084, although the manuscript says
+#   1083 new samples.
+#
+# The final training table corresponds to:
+#   +634 Neutral
+#   +449 Joy
+#   =1083 samples.
+#
+# Therefore FINAL_NEUTRAL_TARGET is configurable below.
+# ============================================================
+
+import os
+import re
+import random
+import argparse
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+
+from openai import OpenAI
+
+
+# ============================================================
+# REPRODUCIBILITY
+# ============================================================
+
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# To reproduce the final distribution reported in Table 3:
+FINAL_NEUTRAL_TARGET = 634
+FINAL_JOY_TARGET = 449
+
+# If you want to reproduce the literal prompt count instead:
+# FINAL_NEUTRAL_TARGET = 635
+#
+# The manuscript itself says 635 Neutral and 449 Joy,
+# but the final table gives +634 Neutral and +449 Joy.
+
+THEMES = [
+    "sports",
+    "politics",
+    "culture",
+    "society"
+]
+
+MAX_TOKENS = 512
+
+GPT_MODEL = "gpt-4o"
+
+TRAIN_RATIO = 0.70
+VAL_RATIO = 0.15
+TEST_RATIO = 0.15
+
+
+# ============================================================
+# OPENAI
+# ============================================================
+
+api_key = os.getenv("OPENAI_API_KEY")
+
+if not api_key:
+    raise RuntimeError(
+        "OPENAI_API_KEY is not defined."
+    )
+
+client = OpenAI(
+    api_key=api_key
+)
+
+
+# ============================================================
+# EXACT SYSTEM PROMPT FROM MANUSCRIPT
+# ============================================================
+
+SYSTEM_PROMPT = """
+You are a highly advanced artificial intelligence model trained to
+generate spontaneous transcription in the Tunisian dialect.
+
+Your task is to create formal, informal, code-switching words
+(French or English), unplanned conversations with natural
+disfluencies such as hesitations and colloquialisms.
+
+The generated text should reflect themes of sports, politics,
+culture, and society, ensuring linguistic coherence and relevance
+to the Tunisian context.
+
+The examples should be distributed proportionally between emotional
+tones: neutral and joy.
+
+For neutral, generate 635 examples evenly across the four themes.
+The remaining examples should focus on joy, also distributed equally
+across the themes.
+"""
+
+
+# ============================================================
+# EXACT USER PROMPT TEMPLATE FROM MANUSCRIPT
+# ============================================================
+
+def build_user_prompt(
+    number_examples,
+    theme,
+    emotion
+):
+
+    return f"""
+Generate {number_examples} examples of spontaneous transcription
+in the Tunisian dialect for the theme of {theme}.
+
+Examples should include hesitations, code-switching words
+(French or English), formal, informal expressions, and
+colloquialisms while maintaining coherence.
+
+Focus on the emotional tone of {emotion}.
+"""
+
+
+# ============================================================
+# COLUMN DETECTION
+# ============================================================
+
+def detect_column(
+    df,
+    candidates
+):
+
+    lower = {
+        str(c).lower().strip(): c
+        for c in df.columns
+    }
+
+    for candidate in candidates:
+
+        if candidate.lower() in lower:
+
+            return lower[candidate.lower()]
+
+    return None
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+def load_asr_excel(path):
+
+    df = pd.read_excel(path)
+
+    id_col = detect_column(
+        df,
+        ["ID", "id"]
+    )
+
+    speaker_col = detect_column(
+        df,
+        [
+            "Speaker",
+            "speaker",
+            "Speaker_ID",
+            "SpeakerID"
+        ]
+    )
+
+    text_col = detect_column(
+        df,
+        [
+            "Contenu",
+            "content",
+            "text",
+            "Text",
+            "Transcription",
+            "transcription"
+        ]
+    )
+
+    class_col = detect_column(
+        df,
+        [
+            "Classe",
+            "class",
+            "label",
+            "Label",
+            "Emotion",
+            "emotion"
+        ]
+    )
+
+    if speaker_col is None:
+
+        raise ValueError(
+            "A Speaker column is required because the manuscript "
+            "uses a speaker-independent 70/15/15 split."
+        )
+
+    if text_col is None or class_col is None:
+
+        raise ValueError(
+            "The Excel must contain transcription and emotion "
+            "class columns."
+        )
+
+    df = df.rename(
+        columns={
+            id_col: "ID",
+            speaker_col: "Speaker",
+            text_col: "Contenu",
+            class_col: "Classe"
+        }
+    )
+
+    df["Contenu"] = (
+        df["Contenu"]
+        .fillna("")
+        .astype(str)
+    )
+
+    df["Classe"] = (
+        df["Classe"]
+        .astype(str)
+        .str.lower()
+        .str.strip()
+    )
+
+    # Harmonize labels used in the manuscript.
+    label_map = {
+        "angry": "anger",
+        "anger": "anger",
+        "joy": "joy",
+        "happy": "joy",
+        "disgust": "disgust",
+        "sad": "sadness",
+        "sadness": "sadness",
+        "neutral": "neutral",
+        "satisfied": "satisfaction",
+        "satisfaction": "satisfaction"
+    }
+
+    df["Classe"] = df["Classe"].map(
+        lambda x: label_map.get(x, x)
+    )
+
+    return df
+
+
+# ============================================================
+# SPEAKER-INDEPENDENT SPLIT
+# ============================================================
+
+def speaker_independent_split(df):
+
+    speakers = (
+        df["Speaker"]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+
+    train_speakers, remaining = train_test_split(
+        speakers,
+        test_size=0.30,
+        random_state=SEED
+    )
+
+    val_speakers, test_speakers = train_test_split(
+        remaining,
+        test_size=0.50,
+        random_state=SEED
+    )
+
+    train_df = df[
+        df["Speaker"].isin(train_speakers)
+    ].copy()
+
+    val_df = df[
+        df["Speaker"].isin(val_speakers)
+    ].copy()
+
+    test_df = df[
+        df["Speaker"].isin(test_speakers)
+    ].copy()
+
+    return (
+        train_df,
+        val_df,
+        test_df
+    )
+
+
+# ============================================================
+# GPT-4o GENERATION
+# ============================================================
+
+def generate_examples(
+    number_examples,
+    theme,
+    emotion
+):
+
+    prompt = build_user_prompt(
+        number_examples,
+        theme,
+        emotion
+    )
+
+    response = client.chat.completions.create(
+
+        model=GPT_MODEL,
+
+        messages=[
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+
+        max_tokens=MAX_TOKENS
+    )
+
+    text = response.choices[0].message.content
+
+    lines = []
+
+    for line in text.splitlines():
+
+        line = line.strip()
+
+        line = re.sub(
+            r"^[\d\-\•\.\)\s]+",
+            "",
+            line
+        )
+
+        if line:
+            lines.append(line)
+
+    return lines
+
+
+# ============================================================
+# GENERATE REQUIRED AMOUNT
+# ============================================================
+
+def generate_class(
+    target,
+    emotion
+):
+
+    base = target // len(THEMES)
+
+    remainder = target % len(THEMES)
+
+    theme_targets = {}
+
+    for i, theme in enumerate(THEMES):
+
+        theme_targets[theme] = (
+            base + (1 if i < remainder else 0)
+        )
+
+    rows = []
+
+    counter = 0
+
+    for theme in THEMES:
+
+        target_theme = theme_targets[theme]
+
+        generated = []
+
+        while len(generated) < target_theme:
+
+            remaining = (
+                target_theme - len(generated)
+            )
+
+            batch_size = min(
+                20,
+                remaining
+            )
+
+            batch = generate_examples(
+                number_examples=batch_size,
+                theme=theme,
+                emotion=emotion
+            )
+
+            generated.extend(batch)
+
+        generated = generated[
+            :target_theme
+        ]
+
+        for text in generated:
+
+            counter += 1
+
+            rows.append({
+
+                "ID":
+                    f"SYNTH_{emotion.upper()}_{counter:04d}",
+
+                "Speaker":
+                    f"SYNTHETIC_{emotion}",
+
+                "Contenu":
+                    text,
+
+                "Classe":
+                    emotion,
+
+                "Theme":
+                    theme,
+
+                "Synthetic":
+                    1
+            })
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# MAIN AUGMENTATION
+# ============================================================
+
+def augment_training_data(
+    input_excel,
+    output_dir,
+    asr_name
+):
+
+    output_dir = Path(output_dir)
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    df = load_asr_excel(
+        input_excel
+    )
+
+    print(
+        f"Original samples: {len(df)}"
+    )
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # SPLIT BEFORE AUGMENTATION
+    # --------------------------------------------------------
+
+    train_df, val_df, test_df = (
+        speaker_independent_split(df)
+    )
+
+    print(
+        f"Train original: {len(train_df)}"
+    )
+
+    print(
+        f"Validation original: {len(val_df)}"
+    )
+
+    print(
+        f"Test original: {len(test_df)}"
+    )
+
+    # --------------------------------------------------------
+    # AUGMENT TRAIN ONLY
+    # --------------------------------------------------------
+
+    neutral_df = generate_class(
+        FINAL_NEUTRAL_TARGET,
+        "neutral"
+    )
+
+    joy_df = generate_class(
+        FINAL_JOY_TARGET,
+        "joy"
+    )
+
+    synthetic = pd.concat(
+        [
+            neutral_df,
+            joy_df
+        ],
+        ignore_index=True
+    )
+
+    augmented_train = pd.concat(
+        [
+            train_df.assign(
+                Synthetic=0
+            ),
+            synthetic
+        ],
+        ignore_index=True
+    )
+
+    # --------------------------------------------------------
+    # SAVE
+    # --------------------------------------------------------
+
+    prefix = asr_name.lower()
+
+    train_file = (
+        output_dir /
+        f"{prefix}_train_augmented.xlsx"
+    )
+
+    val_file = (
+        output_dir /
+        f"{prefix}_validation_original.xlsx"
+    )
+
+    test_file = (
+        output_dir /
+        f"{prefix}_test_original.xlsx"
+    )
+
+    augmented_train.to_excel(
+        train_file,
+        index=False
+    )
+
+    val_df.assign(
+        Synthetic=0
+    ).to_excel(
+        val_file,
+        index=False
+    )
+
+    test_df.assign(
+        Synthetic=0
+    ).to_excel(
+        test_file,
+        index=False
+    )
+
+    print()
+    print("=" * 70)
+    print("AUGMENTATION COMPLETED")
+    print("=" * 70)
+
+    print(
+        augmented_train["Classe"]
+        .value_counts()
+    )
+
+    print(
+        f"\nTrain: {train_file}"
+    )
+
+    print(
+        f"Validation: {val_file}"
+    )
+
+    print(
+        f"Test: {test_file}"
+    )
+
+
+# ============================================================
+# COMMAND LINE
+# ============================================================
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--input",
+        required=True
+    )
+
+    parser.add_argument(
+        "--output",
+        default="data/augmented"
+    )
+
+    parser.add_argument(
+        "--asr",
+        required=True,
+        choices=[
+            "voiser",
+            "transkriptor",
+            "linto"
+        ]
+    )
+
+    args = parser.parse_args()
+
+    augment_training_data(
+        input_excel=args.input,
+        output_dir=args.output,
+        asr_name=args.asr
+    )

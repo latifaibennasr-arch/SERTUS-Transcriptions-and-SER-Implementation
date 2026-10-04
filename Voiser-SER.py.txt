@@ -1,0 +1,1374 @@
+# ============================================================
+# SERTUS - VOISER TRANSCRIPTION-BASED SER
+# ============================================================
+#
+# INPUT:
+#   data/augmented/voiser_train_augmented.xlsx
+#   data/augmented/voiser_validation_original.xlsx
+#   data/augmented/voiser_test_original.xlsx
+#
+# VOISER ABLATION:
+#
+#   A1: Stop-word removal
+#   A2: Stop-word + COTA
+#   A3: Stop-word + COTA + Manual correction
+#   A4: Stop-word + COTA + LLaMA-3-8B-Instruct
+#   A5: Stop-word + COTA + GPT-4o
+#
+# MODELS:
+#
+#   ML:
+#       SVM-linear
+#       Naive Bayes
+#       Logistic Regression
+#       Random Forest (180 trees)
+#
+#   DL:
+#       LSTM-Skip-Gram
+#       BiLSTM-Skip-Gram
+#       LSTM-CBOW
+#       BiLSTM-CBOW
+#
+#   PLM:
+#       TunBERT
+#       AraBERTv0.2
+#
+# ============================================================
+
+import os
+import re
+import random
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from sklearn.feature_extraction.text import (
+    TfidfVectorizer,
+    CountVectorizer
+)
+
+from sklearn.svm import SVC
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+
+from sklearn.metrics import (
+    accuracy_score,
+    precision_recall_fscore_support,
+    classification_report,
+    confusion_matrix
+)
+
+from gensim.models import Word2Vec
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    AdamW,
+    get_linear_schedule_with_warmup
+)
+
+from openai import OpenAI
+
+warnings.filterwarnings(
+    "ignore"
+)
+
+
+# ============================================================
+# CONFIGURATION FROM MANUSCRIPT
+# ============================================================
+
+SEEDS = [
+    42,
+    123,
+    2024,
+    7,
+    99
+]
+
+EMOTIONS = [
+    "anger",
+    "joy",
+    "disgust",
+    "sadness",
+    "neutral",
+    "satisfaction"
+]
+
+# DL
+DL_EPOCHS = 180
+DL_LR = [0.001, 0.002]
+DROPOUT = 0.3
+
+# Transformer
+TRANSFORMER_LR = 3e-5
+BATCH_SIZE = 16
+WEIGHT_DECAY = 0.01
+TRANSFORMER_DROPOUT = 0.1
+MAX_EPOCHS = 20
+WARMUP_RATIO = 0.10
+MAX_LENGTH = 512
+
+# RF
+RF_TREES = 180
+
+# Word2Vec
+WORD2VEC_VECTOR_SIZE = 100
+WORD2VEC_WINDOW = 5
+WORD2VEC_MIN_COUNT = 1
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+TRAIN_FILE = (
+    "data/augmented/"
+    "voiser_train_augmented.xlsx"
+)
+
+VAL_FILE = (
+    "data/augmented/"
+    "voiser_validation_original.xlsx"
+)
+
+TEST_FILE = (
+    "data/augmented/"
+    "voiser_test_original.xlsx"
+)
+
+STOPWORDS_FILE = (
+    "resources/stopwords_179.txt"
+)
+
+RESULT_DIR = Path(
+    "results/voiser"
+)
+
+RESULT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ============================================================
+# MODELS
+# ============================================================
+
+ARABERT_MODEL = (
+    "aubmindlab/bert-base-arabertv02"
+)
+
+# IMPORTANT:
+# Replace this with the exact TunBERT checkpoint used in
+# your original experiments if it differs.
+TUNBERT_MODEL = (
+    "YOUR_EXACT_TUNBERT_CHECKPOINT"
+)
+
+
+# ============================================================
+# REPRODUCIBILITY
+# ============================================================
+
+def set_seed(seed):
+
+    random.seed(seed)
+
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+
+    torch.cuda.manual_seed_all(seed)
+
+
+# ============================================================
+# LOAD EXCEL
+# ============================================================
+
+def load_excel(path):
+
+    df = pd.read_excel(path)
+
+    df["Contenu"] = (
+        df["Contenu"]
+        .fillna("")
+        .astype(str)
+    )
+
+    df["Classe"] = (
+        df["Classe"]
+        .astype(str)
+        .str.lower()
+        .str.strip()
+    )
+
+    return df
+
+
+# ============================================================
+# STOPWORDS
+# ============================================================
+
+def load_stopwords():
+
+    with open(
+        STOPWORDS_FILE,
+        "r",
+        encoding="utf-8"
+    ) as f:
+
+        return set(
+            x.strip()
+            for x in f
+            if x.strip()
+        )
+
+
+def remove_stopwords(
+    text,
+    stopwords
+):
+
+    return " ".join(
+        word
+        for word in text.split()
+        if word not in stopwords
+    )
+
+
+# ============================================================
+# COTA
+# ============================================================
+
+def apply_cota(text):
+
+    """
+    COTA is used exactly as a preprocessing alternative
+    in the manuscript.
+
+    The manuscript specifies the latest COTA system but does
+    not specify a Python API/package version.
+
+    Therefore this function must be connected to the exact
+    COTA implementation/version used by the authors.
+
+    It intentionally raises an error rather than silently
+    replacing COTA with another normalizer.
+    """
+
+    raise NotImplementedError(
+        "Connect this function to the exact COTA "
+        "version/configuration used in the manuscript."
+    )
+
+
+# ============================================================
+# LLAMA-3 / GPT-4o CORRECTION PROMPT
+# ============================================================
+
+CORRECTION_SYSTEM_PROMPT = """
+You are an artificial intelligence model trained to correct texts
+in the Tunisian dialect.
+
+Your task is to correct numbers, orthographic errors, and issues
+related to the integration of code-switching words (French or
+English). Adapt these words so that they integrate correctly into
+the Tunisian dialect while maintaining the fluency and meaning of
+the text.
+
+The numbers should also be corrected to align with the standard
+usage in Tunisian Arabic.
+
+Make corrections precise and clear without altering the original
+meaning of the text.
+"""
+
+
+def correction_prompt(text):
+
+    return f"""
+Here is the text to correct: "{text}"
+
+Return a corrected and coherent version in Tunisian Arabic,
+with all necessary corrections, including code-switching words,
+numbers, and writing errors.
+"""
+
+
+# ============================================================
+# GPT-4o CORRECTION
+# ============================================================
+
+def gpt4o_correct(text):
+
+    client = OpenAI(
+        api_key=os.environ["OPENAI_API_KEY"]
+    )
+
+    response = client.chat.completions.create(
+
+        model="gpt-4o",
+
+        messages=[
+            {
+                "role":
+                    "system",
+                "content":
+                    CORRECTION_SYSTEM_PROMPT
+            },
+            {
+                "role":
+                    "user",
+                "content":
+                    correction_prompt(text)
+            }
+        ],
+
+        max_tokens=512
+    )
+
+    return (
+        response
+        .choices[0]
+        .message
+        .content
+        .strip()
+    )
+
+
+# ============================================================
+# LLAMA-3 CORRECTION
+# ============================================================
+
+def llama3_correct(text):
+
+    from transformers import (
+        AutoTokenizer,
+        AutoModelForCausalLM
+    )
+
+    model_name = (
+        "meta-llama/"
+        "Meta-Llama-3-8B-Instruct"
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        device_map="auto"
+    )
+
+    messages = [
+        {
+            "role":
+                "system",
+            "content":
+                CORRECTION_SYSTEM_PROMPT
+        },
+        {
+            "role":
+                "user",
+            "content":
+                correction_prompt(text)
+        }
+    ]
+
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512
+    ).to(model.device)
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=512,
+        do_sample=False
+    )
+
+    generated = outputs[
+        0
+    ][
+        inputs["input_ids"].shape[1]:
+    ]
+
+    return tokenizer.decode(
+        generated,
+        skip_special_tokens=True
+    ).strip()
+
+
+# ============================================================
+# PREPROCESSING
+# ============================================================
+
+def preprocess(
+    train,
+    val,
+    test,
+    alternative
+):
+
+    stopwords = load_stopwords()
+
+    def process(df):
+
+        out = df.copy()
+
+        out["Processed"] = out[
+            "Contenu"
+        ].apply(
+            lambda x:
+            remove_stopwords(
+                x,
+                stopwords
+            )
+        )
+
+        if alternative == "without_cota":
+            return out
+
+        if alternative.startswith(
+            "cota"
+        ):
+
+            out["Processed"] = out[
+                "Processed"
+            ].apply(
+                apply_cota
+            )
+
+        if alternative == "cota_manual":
+
+            manual_file = Path(
+                "manual_correction/"
+                "voiser_manual.xlsx"
+            )
+
+            if not manual_file.exists():
+
+                raise FileNotFoundError(
+                    "Manual correction file is required."
+                )
+
+            manual = pd.read_excel(
+                manual_file
+            )
+
+            out = out.merge(
+                manual[
+                    ["ID", "Corrected"]
+                ],
+                on="ID",
+                how="left"
+            )
+
+            out["Processed"] = (
+                out["Corrected"]
+                .fillna(
+                    out["Processed"]
+                )
+            )
+
+        elif alternative == "cota_llama3":
+
+            out["Processed"] = out[
+                "Processed"
+            ].apply(
+                llama3_correct
+            )
+
+        elif alternative == "cota_gpt4o":
+
+            out["Processed"] = out[
+                "Processed"
+            ].apply(
+                gpt4o_correct
+            )
+
+        return out
+
+    return (
+        process(train),
+        process(val),
+        process(test)
+    )
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def metrics(
+    y_true,
+    y_pred
+):
+
+    p, r, f, _ = (
+        precision_recall_fscore_support(
+            y_true,
+            y_pred,
+            average="weighted",
+            zero_division=0
+        )
+    )
+
+    return {
+        "Accuracy":
+            accuracy_score(
+                y_true,
+                y_pred
+            ),
+        "Precision": p,
+        "Recall": r,
+        "F1": f
+    }
+
+
+# ============================================================
+# TF-IDF + ML
+# ============================================================
+
+def run_ml(
+    train,
+    test
+):
+
+    vectorizer = TfidfVectorizer(
+        ngram_range=(1, 2)
+    )
+
+    X_train = vectorizer.fit_transform(
+        train["Processed"]
+    )
+
+    X_test = vectorizer.transform(
+        test["Processed"]
+    )
+
+    y_train = train["Classe"]
+    y_test = test["Classe"]
+
+    models = {
+
+        "SVM":
+            SVC(
+                kernel="linear"
+            ),
+
+        "NB":
+            MultinomialNB(),
+
+        "LR":
+            LogisticRegression(
+                max_iter=2000
+            ),
+
+        "RF":
+            RandomForestClassifier(
+                n_estimators=RF_TREES,
+                random_state=42
+            )
+    }
+
+    results = []
+
+    for name, model in models.items():
+
+        model.fit(
+            X_train,
+            y_train
+        )
+
+        pred = model.predict(
+            X_test
+        )
+
+        result = metrics(
+            y_test,
+            pred
+        )
+
+        result["Model"] = name
+
+        results.append(result)
+
+    return results
+
+
+# ============================================================
+# WORD2VEC
+# ============================================================
+
+def train_word2vec(
+    train_texts,
+    sg
+):
+
+    sentences = [
+        text.split()
+        for text in train_texts
+    ]
+
+    return Word2Vec(
+        sentences=sentences,
+        vector_size=WORD2VEC_VECTOR_SIZE,
+        window=WORD2VEC_WINDOW,
+        min_count=WORD2VEC_MIN_COUNT,
+        sg=sg,
+        workers=1,
+        seed=42
+    )
+
+
+def text_to_embedding(
+    text,
+    model
+):
+
+    vectors = []
+
+    for word in text.split():
+
+        if word in model.wv:
+
+            vectors.append(
+                model.wv[word]
+            )
+
+    if not vectors:
+
+        return np.zeros(
+            WORD2VEC_VECTOR_SIZE
+        )
+
+    return np.mean(
+        vectors,
+        axis=0
+    )
+
+
+# ============================================================
+# LSTM / BiLSTM
+# ============================================================
+
+class EmotionRNN(nn.Module):
+
+    def __init__(
+        self,
+        bidirectional=False
+    ):
+
+        super().__init__()
+
+        self.rnn = nn.LSTM(
+            input_size=WORD2VEC_VECTOR_SIZE,
+            hidden_size=128,
+            batch_first=True,
+            bidirectional=bidirectional
+        )
+
+        multiplier = (
+            2 if bidirectional else 1
+        )
+
+        self.fc1 = nn.Linear(
+            128 * multiplier,
+            64
+        )
+
+        self.fc2 = nn.Linear(
+            64,
+            32
+        )
+
+        self.dropout = nn.Dropout(
+            DROPOUT
+        )
+
+        self.output = nn.Linear(
+            32,
+            len(EMOTIONS)
+        )
+
+    def forward(self, x):
+
+        x, _ = self.rnn(x)
+
+        x = x[:, -1, :]
+
+        x = torch.relu(
+            self.fc1(x)
+        )
+
+        x = self.dropout(x)
+
+        x = torch.relu(
+            self.fc2(x)
+        )
+
+        x = self.dropout(x)
+
+        return self.output(x)
+
+
+# ============================================================
+# SEQUENCE PREPARATION
+# ============================================================
+
+def create_sequences(
+    texts,
+    word_model,
+    max_words=100
+):
+
+    sequences = []
+
+    for text in texts:
+
+        vectors = []
+
+        for word in text.split():
+
+            if word in word_model.wv:
+
+                vectors.append(
+                    word_model.wv[word]
+                )
+
+        if not vectors:
+
+            vectors = [
+                np.zeros(
+                    WORD2VEC_VECTOR_SIZE
+                )
+            ]
+
+        vectors = vectors[
+            :max_words
+        ]
+
+        while len(vectors) < max_words:
+
+            vectors.append(
+                np.zeros(
+                    WORD2VEC_VECTOR_SIZE
+                )
+            )
+
+        sequences.append(vectors)
+
+    return np.array(
+        sequences,
+        dtype=np.float32
+    )
+
+
+# ============================================================
+# TRAIN RNN
+# ============================================================
+
+def run_rnn(
+    train,
+    val,
+    test,
+    sg,
+    bidirectional,
+    lr,
+    seed
+):
+
+    set_seed(seed)
+
+    word_model = train_word2vec(
+        train["Processed"].tolist(),
+        sg=sg
+    )
+
+    X_train = create_sequences(
+        train["Processed"],
+        word_model
+    )
+
+    X_val = create_sequences(
+        val["Processed"],
+        word_model
+    )
+
+    X_test = create_sequences(
+        test["Processed"],
+        word_model
+    )
+
+    label2id = {
+        x: i
+        for i, x in enumerate(
+            EMOTIONS
+        )
+    }
+
+    y_train = np.array([
+        label2id[x]
+        for x in train["Classe"]
+    ])
+
+    y_val = np.array([
+        label2id[x]
+        for x in val["Classe"]
+    ])
+
+    y_test = np.array([
+        label2id[x]
+        for x in test["Classe"]
+    ])
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    model = EmotionRNN(
+        bidirectional=bidirectional
+    ).to(device)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=lr
+    )
+
+    criterion = nn.CrossEntropyLoss()
+
+    train_loader = DataLoader(
+        TensorDataset(
+            torch.tensor(X_train),
+            torch.tensor(y_train)
+        ),
+        batch_size=32,
+        shuffle=True
+    )
+
+    best_f1 = -1
+
+    best_state = None
+
+    for epoch in range(
+        DL_EPOCHS
+    ):
+
+        model.train()
+
+        for X, y in train_loader:
+
+            X = X.to(device)
+            y = y.to(device)
+
+            optimizer.zero_grad()
+
+            logits = model(X)
+
+            loss = criterion(
+                logits,
+                y
+            )
+
+            loss.backward()
+
+            optimizer.step()
+
+        model.eval()
+
+        with torch.no_grad():
+
+            logits = model(
+                torch.tensor(
+                    X_val
+                ).to(device)
+            )
+
+            pred = (
+                logits
+                .argmax(1)
+                .cpu()
+                .numpy()
+            )
+
+        _, _, f1, _ = (
+            precision_recall_fscore_support(
+                y_val,
+                pred,
+                average="weighted",
+                zero_division=0
+            )
+        )
+
+        if f1 > best_f1:
+
+            best_f1 = f1
+
+            best_state = {
+                k: v.cpu().clone()
+                for k, v in model.state_dict().items()
+            }
+
+    model.load_state_dict(
+        best_state
+    )
+
+    model.eval()
+
+    with torch.no_grad():
+
+        logits = model(
+            torch.tensor(
+                X_test
+            ).to(device)
+        )
+
+        pred = (
+            logits
+            .argmax(1)
+            .cpu()
+            .numpy()
+        )
+
+    id2label = {
+        v: k
+        for k, v in label2id.items()
+    }
+
+    y_true = [
+        id2label[x]
+        for x in y_test
+    ]
+
+    y_pred = [
+        id2label[x]
+        for x in pred
+    ]
+
+    result = metrics(
+        y_true,
+        y_pred
+    )
+
+    result["Model"] = (
+        ("BiLSTM" if bidirectional else "LSTM")
+        + ("-SkipGram" if sg else "-CBOW")
+    )
+
+    return result
+
+
+# ============================================================
+# TRANSFORMER
+# ============================================================
+
+def run_transformer(
+    train,
+    val,
+    test,
+    model_name,
+    seed
+):
+
+    set_seed(seed)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name
+    )
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name,
+        num_labels=len(EMOTIONS),
+        hidden_dropout_prob=TRANSFORMER_DROPOUT
+    )
+
+    label2id = {
+        x: i
+        for i, x in enumerate(
+            EMOTIONS
+        )
+    }
+
+    id2label = {
+        i: x
+        for x, i in label2id.items()
+    }
+
+    model.config.label2id = label2id
+    model.config.id2label = id2label
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    model.to(device)
+
+    train_enc = tokenizer(
+        train["Processed"].tolist(),
+        padding=True,
+        truncation=True,
+        max_length=MAX_LENGTH,
+        return_tensors="pt"
+    )
+
+    val_enc = tokenizer(
+        val["Processed"].tolist(),
+        padding=True,
+        truncation=True,
+        max_length=MAX_LENGTH,
+        return_tensors="pt"
+    )
+
+    test_enc = tokenizer(
+        test["Processed"].tolist(),
+        padding=True,
+        truncation=True,
+        max_length=MAX_LENGTH,
+        return_tensors="pt"
+    )
+
+    y_train = torch.tensor([
+        label2id[x]
+        for x in train["Classe"]
+    ])
+
+    y_val = np.array([
+        label2id[x]
+        for x in val["Classe"]
+    ])
+
+    y_test = np.array([
+        label2id[x]
+        for x in test["Classe"]
+    ])
+
+    dataset = TensorDataset(
+        train_enc["input_ids"],
+        train_enc["attention_mask"],
+        y_train
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True
+    )
+
+    optimizer = AdamW(
+        model.parameters(),
+        lr=TRANSFORMER_LR,
+        weight_decay=WEIGHT_DECAY
+    )
+
+    total_steps = (
+        len(loader) * MAX_EPOCHS
+    )
+
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(
+            WARMUP_RATIO * total_steps
+        ),
+        num_training_steps=total_steps
+    )
+
+    best_f1 = -1
+
+    best_state = None
+
+    for epoch in range(
+        MAX_EPOCHS
+    ):
+
+        model.train()
+
+        for input_ids, mask, labels in loader:
+
+            input_ids = input_ids.to(device)
+            mask = mask.to(device)
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=mask,
+                labels=labels
+            )
+
+            outputs.loss.backward()
+
+            optimizer.step()
+            scheduler.step()
+
+        model.eval()
+
+        with torch.no_grad():
+
+            outputs = model(
+                input_ids=val_enc[
+                    "input_ids"
+                ].to(device),
+
+                attention_mask=val_enc[
+                    "attention_mask"
+                ].to(device)
+            )
+
+        pred = (
+            outputs.logits
+            .argmax(1)
+            .cpu()
+            .numpy()
+        )
+
+        _, _, f1, _ = (
+            precision_recall_fscore_support(
+                y_val,
+                pred,
+                average="weighted",
+                zero_division=0
+            )
+        )
+
+        if f1 > best_f1:
+
+            best_f1 = f1
+
+            best_state = {
+                k: v.cpu().clone()
+                for k, v in model.state_dict().items()
+            }
+
+    model.load_state_dict(
+        best_state
+    )
+
+    model.eval()
+
+    with torch.no_grad():
+
+        outputs = model(
+            input_ids=test_enc[
+                "input_ids"
+            ].to(device),
+
+            attention_mask=test_enc[
+                "attention_mask"
+            ].to(device)
+        )
+
+    pred = (
+        outputs.logits
+        .argmax(1)
+        .cpu()
+        .numpy()
+    )
+
+    y_true = [
+        id2label[x]
+        for x in y_test
+    ]
+
+    y_pred = [
+        id2label[x]
+        for x in pred
+    ]
+
+    result = metrics(
+        y_true,
+        y_pred
+    )
+
+    result["Model"] = model_name
+    result["Seed"] = seed
+
+    return result
+
+
+# ============================================================
+# COMPLETE VOISER EXPERIMENT
+# ============================================================
+
+def main():
+
+    train = load_excel(
+        TRAIN_FILE
+    )
+
+    val = load_excel(
+        VAL_FILE
+    )
+
+    test = load_excel(
+        TEST_FILE
+    )
+
+    alternatives = [
+
+        "without_cota",
+
+        "cota",
+
+        "cota_manual",
+
+        "cota_llama3",
+
+        "cota_gpt4o"
+    ]
+
+    all_results = []
+
+    for alternative in alternatives:
+
+        print(
+            f"\n===== {alternative} ====="
+        )
+
+        train_p, val_p, test_p = preprocess(
+            train,
+            val,
+            test,
+            alternative
+        )
+
+        # ----------------------------------------------------
+        # ML
+        # ----------------------------------------------------
+
+        ml_results = run_ml(
+            train_p,
+            test_p
+        )
+
+        for result in ml_results:
+
+            result["ASR"] = "Voiser"
+            result["Alternative"] = alternative
+
+            all_results.append(result)
+
+        # ----------------------------------------------------
+        # DL
+        # ----------------------------------------------------
+
+        for seed in SEEDS:
+
+            for lr in DL_LR:
+
+                for sg in [0, 1]:
+
+                    for bidirectional in [
+                        False,
+                        True
+                    ]:
+
+                        result = run_rnn(
+                            train_p,
+                            val_p,
+                            test_p,
+                            sg=sg,
+                            bidirectional=bidirectional,
+                            lr=lr,
+                            seed=seed
+                        )
+
+                        result["ASR"] = "Voiser"
+                        result[
+                            "Alternative"
+                        ] = alternative
+
+                        result["Seed"] = seed
+
+                        result["LearningRate"] = lr
+
+                        all_results.append(
+                            result
+                        )
+
+        # ----------------------------------------------------
+        # TRANSFORMERS
+        # ----------------------------------------------------
+
+        for seed in SEEDS:
+
+            result = run_transformer(
+                train_p,
+                val_p,
+                test_p,
+                ARABERT_MODEL,
+                seed
+            )
+
+            result["ASR"] = "Voiser"
+            result["Alternative"] = alternative
+
+            all_results.append(
+                result
+            )
+
+            if (
+                TUNBERT_MODEL
+                != "YOUR_EXACT_TUNBERT_CHECKPOINT"
+            ):
+
+                result = run_transformer(
+                    train_p,
+                    val_p,
+                    test_p,
+                    TUNBERT_MODEL,
+                    seed
+                )
+
+                result["ASR"] = "Voiser"
+                result["Alternative"] = alternative
+
+                all_results.append(
+                    result
+                )
+
+    results = pd.DataFrame(
+        all_results
+    )
+
+    results.to_excel(
+        RESULT_DIR /
+        "voiser_SER_results.xlsx",
+        index=False
+    )
+
+    print(
+        "\nResults saved to:"
+    )
+
+    print(
+        RESULT_DIR /
+        "voiser_SER_results.xlsx"
+    )
+
+
+if __name__ == "__main__":
+
+    main()

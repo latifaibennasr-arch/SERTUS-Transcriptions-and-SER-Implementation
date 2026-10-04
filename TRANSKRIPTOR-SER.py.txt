@@ -1,0 +1,1024 @@
+# ============================================================
+# SERTUS - TRANSKRIPTOR SER
+# ============================================================
+#
+# The manuscript reports that, after the Voiser ablation,
+# COTA was excluded for LinTO and Transkriptor.
+#
+# Therefore:
+#
+#       Transkriptor
+#             |
+#       Stop-word removal
+#             |
+#       Camel Tools
+#             |
+#       TF-IDF / Word2Vec
+#             |
+#       ML / DL / TunBERT / AraBERT
+#
+# ============================================================
+
+from pathlib import Path
+import random
+import warnings
+
+import numpy as np
+import pandas as pd
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+from sklearn.svm import SVC
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+
+from sklearn.metrics import (
+    accuracy_score,
+    precision_recall_fscore_support
+)
+
+from gensim.models import Word2Vec
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    AdamW,
+    get_linear_schedule_with_warmup
+)
+
+warnings.filterwarnings(
+    "ignore"
+)
+
+
+# ============================================================
+# EXPERIMENTAL SETTINGS FROM MANUSCRIPT
+# ============================================================
+
+SEEDS = [
+    42,
+    123,
+    2024,
+    7,
+    99
+]
+
+EMOTIONS = [
+    "anger",
+    "joy",
+    "disgust",
+    "sadness",
+    "neutral",
+    "satisfaction"
+]
+
+RF_TREES = 180
+
+DL_EPOCHS = 180
+
+DL_LEARNING_RATES = [
+    0.001,
+    0.002
+]
+
+DROPOUT = 0.3
+
+TRANSFORMER_LR = 3e-5
+
+BATCH_SIZE = 16
+
+WEIGHT_DECAY = 0.01
+
+TRANSFORMER_DROPOUT = 0.1
+
+MAX_EPOCHS = 20
+
+WARMUP_RATIO = 0.10
+
+MAX_LENGTH = 512
+
+WORD2VEC_SIZE = 100
+
+WORD2VEC_WINDOW = 5
+
+
+# ============================================================
+# FILES
+# ============================================================
+
+TRAIN_FILE = (
+    "data/augmented/"
+    "transkriptor_train_augmented.xlsx"
+)
+
+VAL_FILE = (
+    "data/augmented/"
+    "transkriptor_validation_original.xlsx"
+)
+
+TEST_FILE = (
+    "data/augmented/"
+    "transkriptor_test_original.xlsx"
+)
+
+STOPWORDS_FILE = (
+    "resources/stopwords_179.txt"
+)
+
+RESULT_DIR = Path(
+    "results/transkriptor"
+)
+
+RESULT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ============================================================
+# MODEL CHECKPOINTS
+# ============================================================
+
+ARABERT_MODEL = (
+    "aubmindlab/bert-base-arabertv02"
+)
+
+TUNBERT_MODEL = (
+    "YOUR_EXACT_TUNBERT_CHECKPOINT"
+)
+
+
+# ============================================================
+# SEED
+# ============================================================
+
+def set_seed(seed):
+
+    random.seed(seed)
+
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+
+    torch.cuda.manual_seed_all(seed)
+
+
+# ============================================================
+# DATA
+# ============================================================
+
+def load_data(path):
+
+    df = pd.read_excel(path)
+
+    df["Contenu"] = (
+        df["Contenu"]
+        .fillna("")
+        .astype(str)
+    )
+
+    df["Classe"] = (
+        df["Classe"]
+        .astype(str)
+        .str.lower()
+        .str.strip()
+    )
+
+    return df
+
+
+# ============================================================
+# STOPWORDS
+# ============================================================
+
+def load_stopwords():
+
+    with open(
+        STOPWORDS_FILE,
+        "r",
+        encoding="utf-8"
+    ) as f:
+
+        return set(
+            x.strip()
+            for x in f
+            if x.strip()
+        )
+
+
+def preprocess(df):
+
+    stopwords = load_stopwords()
+
+    out = df.copy()
+
+    out["Processed"] = out[
+        "Contenu"
+    ].apply(
+        lambda text:
+        " ".join(
+            w for w in text.split()
+            if w not in stopwords
+        )
+    )
+
+    return out
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def evaluate(
+    y_true,
+    y_pred
+):
+
+    precision, recall, f1, _ = (
+        precision_recall_fscore_support(
+            y_true,
+            y_pred,
+            average="weighted",
+            zero_division=0
+        )
+    )
+
+    return {
+        "Accuracy":
+            accuracy_score(
+                y_true,
+                y_pred
+            ),
+        "Precision":
+            precision,
+        "Recall":
+            recall,
+        "F1":
+            f1
+    }
+
+
+# ============================================================
+# TF-IDF + ML
+# ============================================================
+
+def run_ml(
+    train,
+    test
+):
+
+    vectorizer = TfidfVectorizer(
+        ngram_range=(1, 2)
+    )
+
+    X_train = vectorizer.fit_transform(
+        train["Processed"]
+    )
+
+    X_test = vectorizer.transform(
+        test["Processed"]
+    )
+
+    y_train = train["Classe"]
+
+    y_test = test["Classe"]
+
+    models = {
+
+        "SVM":
+            SVC(
+                kernel="linear"
+            ),
+
+        "NB":
+            MultinomialNB(),
+
+        "LR":
+            LogisticRegression(
+                max_iter=2000
+            ),
+
+        "RF":
+            RandomForestClassifier(
+                n_estimators=RF_TREES,
+                random_state=42
+            )
+    }
+
+    results = []
+
+    for name, model in models.items():
+
+        model.fit(
+            X_train,
+            y_train
+        )
+
+        pred = model.predict(
+            X_test
+        )
+
+        result = evaluate(
+            y_test,
+            pred
+        )
+
+        result["Model"] = name
+
+        results.append(
+            result
+        )
+
+    return results
+
+
+# ============================================================
+# WORD2VEC
+# ============================================================
+
+def build_word2vec(
+    texts,
+    sg
+):
+
+    sentences = [
+        text.split()
+        for text in texts
+    ]
+
+    return Word2Vec(
+        sentences=sentences,
+        vector_size=WORD2VEC_SIZE,
+        window=WORD2VEC_WINDOW,
+        min_count=1,
+        sg=sg,
+        workers=1,
+        seed=42
+    )
+
+
+def make_sequences(
+    texts,
+    model,
+    max_words=100
+):
+
+    X = []
+
+    for text in texts:
+
+        seq = []
+
+        for word in text.split():
+
+            if word in model.wv:
+
+                seq.append(
+                    model.wv[word]
+                )
+
+        seq = seq[:max_words]
+
+        while len(seq) < max_words:
+
+            seq.append(
+                np.zeros(
+                    WORD2VEC_SIZE
+                )
+            )
+
+        X.append(seq)
+
+    return np.asarray(
+        X,
+        dtype=np.float32
+    )
+
+
+# ============================================================
+# RNN
+# ============================================================
+
+class RNNClassifier(nn.Module):
+
+    def __init__(
+        self,
+        bidirectional
+    ):
+
+        super().__init__()
+
+        self.rnn = nn.LSTM(
+            WORD2VEC_SIZE,
+            128,
+            batch_first=True,
+            bidirectional=bidirectional
+        )
+
+        factor = (
+            2 if bidirectional else 1
+        )
+
+        self.fc1 = nn.Linear(
+            128 * factor,
+            64
+        )
+
+        self.fc2 = nn.Linear(
+            64,
+            32
+        )
+
+        self.dropout = nn.Dropout(
+            DROPOUT
+        )
+
+        self.fc3 = nn.Linear(
+            32,
+            6
+        )
+
+    def forward(self, x):
+
+        x, _ = self.rnn(x)
+
+        x = x[:, -1, :]
+
+        x = torch.relu(
+            self.fc1(x)
+        )
+
+        x = self.dropout(x)
+
+        x = torch.relu(
+            self.fc2(x)
+        )
+
+        x = self.dropout(x)
+
+        return self.fc3(x)
+
+
+# ============================================================
+# RNN EXPERIMENT
+# ============================================================
+
+def run_rnn(
+    train,
+    val,
+    test,
+    sg,
+    bidirectional,
+    lr,
+    seed
+):
+
+    set_seed(seed)
+
+    w2v = build_word2vec(
+        train["Processed"],
+        sg
+    )
+
+    X_train = make_sequences(
+        train["Processed"],
+        w2v
+    )
+
+    X_val = make_sequences(
+        val["Processed"],
+        w2v
+    )
+
+    X_test = make_sequences(
+        test["Processed"],
+        w2v
+    )
+
+    label2id = {
+        x: i
+        for i, x in enumerate(
+            EMOTIONS
+        )
+    }
+
+    y_train = np.array([
+        label2id[x]
+        for x in train["Classe"]
+    ])
+
+    y_val = np.array([
+        label2id[x]
+        for x in val["Classe"]
+    ])
+
+    y_test = np.array([
+        label2id[x]
+        for x in test["Classe"]
+    ])
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    model = RNNClassifier(
+        bidirectional
+    ).to(device)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=lr
+    )
+
+    criterion = nn.CrossEntropyLoss()
+
+    loader = DataLoader(
+        TensorDataset(
+            torch.tensor(X_train),
+            torch.tensor(y_train)
+        ),
+        batch_size=32,
+        shuffle=True
+    )
+
+    best_f1 = -1
+
+    best_state = None
+
+    for _ in range(
+        DL_EPOCHS
+    ):
+
+        model.train()
+
+        for X, y in loader:
+
+            X = X.to(device)
+            y = y.to(device)
+
+            optimizer.zero_grad()
+
+            loss = criterion(
+                model(X),
+                y
+            )
+
+            loss.backward()
+
+            optimizer.step()
+
+        model.eval()
+
+        with torch.no_grad():
+
+            val_logits = model(
+                torch.tensor(
+                    X_val
+                ).to(device)
+            )
+
+        val_pred = (
+            val_logits
+            .argmax(1)
+            .cpu()
+            .numpy()
+        )
+
+        _, _, f1, _ = (
+            precision_recall_fscore_support(
+                y_val,
+                val_pred,
+                average="weighted",
+                zero_division=0
+            )
+        )
+
+        if f1 > best_f1:
+
+            best_f1 = f1
+
+            best_state = {
+                k: v.cpu().clone()
+                for k, v in model.state_dict().items()
+            }
+
+    model.load_state_dict(
+        best_state
+    )
+
+    model.eval()
+
+    with torch.no_grad():
+
+        test_logits = model(
+            torch.tensor(
+                X_test
+            ).to(device)
+        )
+
+    pred = (
+        test_logits
+        .argmax(1)
+        .cpu()
+        .numpy()
+    )
+
+    id2label = {
+        i: x
+        for i, x in enumerate(
+            EMOTIONS
+        )
+    }
+
+    result = evaluate(
+        [
+            id2label[x]
+            for x in y_test
+        ],
+        [
+            id2label[x]
+            for x in pred
+        ]
+    )
+
+    result["Model"] = (
+        ("BiLSTM" if bidirectional else "LSTM")
+        +
+        ("-SkipGram" if sg else "-CBOW")
+    )
+
+    result["Seed"] = seed
+
+    result["LearningRate"] = lr
+
+    return result
+
+
+# ============================================================
+# TRANSFORMER
+# ============================================================
+
+def run_transformer(
+    train,
+    val,
+    test,
+    checkpoint,
+    seed
+):
+
+    set_seed(seed)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        checkpoint
+    )
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        checkpoint,
+        num_labels=6,
+        hidden_dropout_prob=0.1
+    )
+
+    label2id = {
+        x: i
+        for i, x in enumerate(
+            EMOTIONS
+        )
+    }
+
+    id2label = {
+        i: x
+        for x, i in label2id.items()
+    }
+
+    model.config.label2id = label2id
+    model.config.id2label = id2label
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    model.to(device)
+
+    def tokenize(df):
+
+        return tokenizer(
+            df["Processed"].tolist(),
+            padding=True,
+            truncation=True,
+            max_length=MAX_LENGTH,
+            return_tensors="pt"
+        )
+
+    train_enc = tokenize(train)
+    val_enc = tokenize(val)
+    test_enc = tokenize(test)
+
+    y_train = torch.tensor([
+        label2id[x]
+        for x in train["Classe"]
+    ])
+
+    y_val = np.array([
+        label2id[x]
+        for x in val["Classe"]
+    ])
+
+    y_test = np.array([
+        label2id[x]
+        for x in test["Classe"]
+    ])
+
+    loader = DataLoader(
+        TensorDataset(
+            train_enc["input_ids"],
+            train_enc["attention_mask"],
+            y_train
+        ),
+        batch_size=BATCH_SIZE,
+        shuffle=True
+    )
+
+    optimizer = AdamW(
+        model.parameters(),
+        lr=TRANSFORMER_LR,
+        weight_decay=WEIGHT_DECAY
+    )
+
+    total_steps = (
+        len(loader) * MAX_EPOCHS
+    )
+
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        int(
+            WARMUP_RATIO * total_steps
+        ),
+        total_steps
+    )
+
+    best_f1 = -1
+
+    best_state = None
+
+    for _ in range(
+        MAX_EPOCHS
+    ):
+
+        model.train()
+
+        for ids, mask, labels in loader:
+
+            ids = ids.to(device)
+            mask = mask.to(device)
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+
+            output = model(
+                input_ids=ids,
+                attention_mask=mask,
+                labels=labels
+            )
+
+            output.loss.backward()
+
+            optimizer.step()
+
+            scheduler.step()
+
+        model.eval()
+
+        with torch.no_grad():
+
+            output = model(
+                input_ids=val_enc[
+                    "input_ids"
+                ].to(device),
+
+                attention_mask=val_enc[
+                    "attention_mask"
+                ].to(device)
+            )
+
+        pred = (
+            output.logits
+            .argmax(1)
+            .cpu()
+            .numpy()
+        )
+
+        _, _, f1, _ = (
+            precision_recall_fscore_support(
+                y_val,
+                pred,
+                average="weighted",
+                zero_division=0
+            )
+        )
+
+        if f1 > best_f1:
+
+            best_f1 = f1
+
+            best_state = {
+                k: v.cpu().clone()
+                for k, v in model.state_dict().items()
+            }
+
+    model.load_state_dict(
+        best_state
+    )
+
+    model.eval()
+
+    with torch.no_grad():
+
+        output = model(
+            input_ids=test_enc[
+                "input_ids"
+            ].to(device),
+
+            attention_mask=test_enc[
+                "attention_mask"
+            ].to(device)
+        )
+
+    pred = (
+        output.logits
+        .argmax(1)
+        .cpu()
+        .numpy()
+    )
+
+    result = evaluate(
+        [
+            id2label[x]
+            for x in y_test
+        ],
+        [
+            id2label[x]
+            for x in pred
+        ]
+    )
+
+    result["Model"] = checkpoint
+    result["Seed"] = seed
+
+    return result
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    train = preprocess(
+        load_data(
+            TRAIN_FILE
+        )
+    )
+
+    val = preprocess(
+        load_data(
+            VAL_FILE
+        )
+    )
+
+    test = preprocess(
+        load_data(
+            TEST_FILE
+        )
+    )
+
+    results = []
+
+    # --------------------------------------------------------
+    # ML
+    # --------------------------------------------------------
+
+    for result in run_ml(
+        train,
+        test
+    ):
+
+        result["ASR"] = "Transkriptor"
+        result["Preprocessing"] = (
+            "StopWordRemoval"
+        )
+
+        results.append(result)
+
+    # --------------------------------------------------------
+    # DL
+    # --------------------------------------------------------
+
+    for seed in SEEDS:
+
+        for lr in DL_LEARNING_RATES:
+
+            for sg in [0, 1]:
+
+                for bidirectional in [
+                    False,
+                    True
+                ]:
+
+                    result = run_rnn(
+                        train,
+                        val,
+                        test,
+                        sg,
+                        bidirectional,
+                        lr,
+                        seed
+                    )
+
+                    result["ASR"] = (
+                        "Transkriptor"
+                    )
+
+                    result["Preprocessing"] = (
+                        "StopWordRemoval"
+                    )
+
+                    results.append(
+                        result
+                    )
+
+    # --------------------------------------------------------
+    # AraBERT
+    # --------------------------------------------------------
+
+    for seed in SEEDS:
+
+        result = run_transformer(
+            train,
+            val,
+            test,
+            ARABERT_MODEL,
+            seed
+        )
+
+        result["ASR"] = (
+            "Transkriptor"
+        )
+
+        result["Preprocessing"] = (
+            "StopWordRemoval"
+        )
+
+        results.append(
+            result
+        )
+
+        # ----------------------------------------------------
+        # TunBERT
+        # ----------------------------------------------------
+
+        if (
+            TUNBERT_MODEL
+            != "YOUR_EXACT_TUNBERT_CHECKPOINT"
+        ):
+
+            result = run_transformer(
+                train,
+                val,
+                test,
+                TUNBERT_MODEL,
+                seed
+            )
+
+            result["ASR"] = (
+                "Transkriptor"
+            )
+
+            result["Preprocessing"] = (
+                "StopWordRemoval"
+            )
+
+            results.append(
+                result
+            )
+
+    pd.DataFrame(
+        results
+    ).to_excel(
+        RESULT_DIR /
+        "transkriptor_SER_results.xlsx",
+        index=False
+    )
+
+
+if __name__ == "__main__":
+
+    main()
